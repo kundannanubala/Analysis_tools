@@ -1,0 +1,38 @@
+# FastAPI dependencies
+fastapi
+uvicorn
+
+# CORS Middleware for FastAPI
+fastapi-cors
+
+# Pydantic for data validation
+pydantic
+
+# PyMuPDF for PDF processing
+pymupdf
+
+# Google Cloud AI Platform SDK for using Vertex AI models
+google-cloud-aiplatform
+
+# Vertex AI SDK for accessing specific models
+vertexai
+
+# Python Dotenv for loading environment variables
+python-dotenv
+
+# LangChain for working with document loaders, retrievers, and LLMs
+langchain
+
+# AstraDB Vector Store for storing embeddings in Cassandra/Astra DB
+langchain_astradb
+
+# Google Generative AI Embeddings for vector generation
+langchain_google_genai
+
+# PyPDFLoader for loading PDFs into LangChain
+langchain_community
+
+# Additional Dependencies
+tqdm
+
+python-multipart

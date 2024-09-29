@@ -1,0 +1,8 @@
+.env
+credentials.json
+.venv
+venv
+__pycache__
+ExtractedImages
+PDF_Analysis.txt
+PDF_Content.txt
