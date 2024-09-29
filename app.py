@@ -1,34 +1,34 @@
 import os
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from pydantic import BaseModel
-from dotenv import load_dotenv
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_astradb import AstraDBVectorStore
+import fitz
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from google.cloud import aiplatform
 from vertexai.vision_models import ImageCaptioningModel, Image
-import fitz  # For PDF extraction
-import time
-from fastapi.middleware.cors import CORSMiddleware
-from qdrant_client.models import Document
+from dotenv import load_dotenv
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_astradb import AstraDBVectorStore
+from langchain.schema import Document
+from pydantic import BaseModel
+from typing import Optional
+from langchain.schema.output_parser import StrOutputParser
+from langchain.schema.runnable import RunnablePassthrough
 from langchain.prompts import ChatPromptTemplate
-
-app = FastAPI()
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Add your frontend URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Load environment variables
 load_dotenv()
 
-# Astra DB Configuration
+MODEL_NAME = os.getenv("MODEL_NAME", "gemini-1.5-flash")
+TOKEN_LIMIT = int(os.getenv("GEMINI_OUTPUT_TOKEN_LIMIT", 8192))
+
+# AstraDB Configuration
 ASTRA_DB_APPLICATION_TOKEN = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
 ASTRA_DB_API_ENDPOINT = os.getenv("ASTRA_DB_API_ENDPOINT")
 COLLECTION_NAME = "pdf_analysis_vector_store"
+
+app = FastAPI()
+
+# Initialize the Vertex AI client
+aiplatform.init(project=os.getenv("GOOGLE_CLOUD_PROJECT"))
 
 # Initialize embeddings
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
@@ -42,35 +42,57 @@ vector_store = AstraDBVectorStore(
     metric="cosine"
 )
 
-# Initialize the image captioning model
-model = ImageCaptioningModel.from_pretrained("imagetext@001")
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro-002", temperature=0.2, max_output_tokens=8000, top_p=0.95, top_k=40)
 
-# PDF analysis and embedding function
-async def analyze_and_store_pdf(pdf_path, output_folder):
+class ChatRequest(BaseModel):
+    question: str
+    source: Optional[str] = None 
+
+@app.post("/analyze-pdf/")
+async def analyze_pdf(pdf_file: UploadFile = File(...)):
     """
     Analyze a PDF file: extract text, images, generate image summaries, and store embeddings in AstraDB.
     
     Args:
-    pdf_path (str): The path to the PDF file.
-    output_folder (str): The folder where images will be saved.
+    pdf_file (UploadFile): The uploaded PDF file.
+    
+    Returns:
+    JSONResponse: A JSON object containing the analysis results.
     """
+    # Create a temporary file to store the uploaded PDF
+    pdf_path = f"temp_{pdf_file.filename}"
+    with open(pdf_path, "wb") as temp_file:
+        temp_file.write(await pdf_file.read())
+    
     # Create the output folder if it doesn't exist
+    output_folder = "ExtractedImages"
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     
     # Open the PDF file
     doc = fitz.open(pdf_path)
-    content_summary = ""  # Store the summary for the API response
+    
+    # Create the image captioning model
+    model = ImageCaptioningModel.from_pretrained("imagetext@001")
+    
+    # Initialize the content dictionary
+    content = {"analysis": f"Analysis of {pdf_file.filename}", "pages": []}
     
     # Iterate through each page
     for page_num, page in enumerate(doc, 1):
+        page_content = {
+            "page_number": page_num,
+            "text_content": "",
+            "images": []
+        }
+        
         # Extract text from the page
         page_text = page.get_text()
         page_text = ' '.join(page_text.split())  # Clean up the text
+        page_content["text_content"] = page_text
         
         # Extract images from the page and generate captions
         image_list = page.get_images()
-        page_content = f"Text content:\n{page_text}\n\n"
         
         for img_index, img in enumerate(image_list, 1):
             xref = img[0]
@@ -88,69 +110,39 @@ async def analyze_and_store_pdf(pdf_path, output_folder):
             image = Image.load_from_file(image_path)
             captions = model.get_captions(image=image, number_of_results=1, language="en")
             summary = captions[0] if captions else "No caption generated"
-            page_content += f"Image {img_index}:\n  Caption: {summary}\n\n"
+            
+            page_content["images"].append({
+                "filename": image_filename,
+                "summary": summary
+            })
         
-        # Combine text and image captions for page-wise embeddings
-        embedding_input = page_content.strip()
-
+        content["pages"].append(page_content)
+        
         # Generate embedding for this page's content
-        embedding_vector = embeddings.embed_query(embedding_input)
-
+        embedding_input = f"Text content:\n{page_text}\n\n" + "\n".join([f"Image {i+1}:\n  Caption: {img['summary']}" for i, img in enumerate(page_content['images'])])
+        
         # Store the page content and its embedding in AstraDB
-        documents = [Document(
-            content=embedding_input,
-            payload={"embedding": embedding_vector}
-        )]
-        vector_store.add_documents(
-            documents=documents,
-            ids=[f"doc_{page_num}"]
-        )
-
-        # Append to content summary for response
-        content_summary += f"Page {page_num} Summary:\n{page_text[:200]}...\n\n"
-
+        documents = [Document(page_content=embedding_input, metadata={"page_num": page_num, "source": pdf_file.filename})]
+        vector_store.add_documents(documents)
+    
     # Close the document
     doc.close()
-
-    return content_summary.strip()
-
-
-@app.post("/process_pdf")
-async def process_pdf_api(file: UploadFile = File(...)):
-    try:
-        # Save the uploaded file temporarily
-        temp_file_path = f"temp_{file.filename}"
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(await file.read())
-
-        # Define the output folder for images
-        output_folder = "ExtractedImages"
-        
-        # Analyze and store the PDF data
-        summary = await analyze_and_store_pdf(temp_file_path, output_folder)
-        
-        # Clean up the temporary file
-        os.remove(temp_file_path)
-
-        # Return a summary of the analysis
-        return {
-            "message": "PDF processed and stored successfully.",
-            "summary": summary
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
-
-
-class ChatRequest(BaseModel):
-    question: str
+    
+    # Remove the temporary PDF file
+    os.remove(pdf_path)
+    
+    return JSONResponse(content=content)
 
 
 @app.post("/chat_with_pdf")
 async def chat_with_pdf_api(chat_request: ChatRequest):
     try:
-        # Set up the retriever
-        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+        # Set up the retriever with optional source filtering
+        search_kwargs = {"k": 5}
+        if chat_request.source:
+            search_kwargs["filter"] = {"source": chat_request.source}
+        
+        retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
 
         # Set up the RAG prompt template
         template = """You are an AI assistant tasked with answering questions based on the provided context. 
@@ -174,7 +166,11 @@ async def chat_with_pdf_api(chat_request: ChatRequest):
 
         # Generate the answer
         response = rag_chain.invoke(chat_request.question)
-        return {"answer": response}
+        return {
+            "answer": response, 
+            "source_filtered": chat_request.source is not None,
+            "filter_applied": chat_request.source if chat_request.source else "None"
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
